@@ -34,6 +34,97 @@ static int check_name(char *name) {
 }
 
 static void
+sqlite3_path_ascend(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+  if (argc != 3 || sqlite3_value_type(argv[0]) != SQLITE_INTEGER ||
+      sqlite3_value_type(argv[1]) != SQLITE_TEXT ||
+      sqlite3_value_type(argv[2]) != SQLITE_TEXT) {
+    sqlite3_result_error(ctx, "Invalid arguments", -1);
+    return;
+  }
+
+  char *q = NULL;
+  char *res = NULL;
+  int errflg = 0;
+  sqlite3_stmt *stmt = NULL;
+  sqlite3 *db = sqlite3_context_db_handle(ctx);
+
+  int id = sqlite3_value_int(argv[0]);
+  char *table_name = (char *)sqlite3_value_text(argv[1]);
+  if (!strcmp(table_name, "")) {
+    table_name = "snippets";
+  }
+  char *dirs_table_name = (char *)sqlite3_value_text(argv[2]);
+  if (!strcmp(dirs_table_name, "")) {
+    dirs_table_name = "dirs";
+  }
+
+  if (!(check_name(table_name) && check_name(dirs_table_name))) {
+    sqlite3_result_error(ctx, "Invalid arguments", -1);
+  }
+
+  q = sdsnew("");
+  if (q == NULL) {
+    sqlite3_result_error_nomem(ctx);
+    goto exit;
+  }
+  q = sdscatprintf(
+      q,
+      "WITH RECURSIVE "
+      "ascend(x, id, name, parent_id) AS ( "
+      "select 1, id, name, parent_id from %1$s where id = (select dir from "
+      "%2$s where id = ?) "
+      "UNION "
+      "SELECT x+1, %1$s.id, %1$s.name, %1$s.parent_id from %1$s, ascend "
+      "where ascend.parent_id = %1$s.id and ascend.id != ascend.parent_id "
+      "limit 255 "
+      ") "
+      "select IIF(count(*) > 1, substr(group_concat(name, '/'),5), '/') from "
+      "(select name from ascend "
+      "order by x desc);",
+      dirs_table_name,
+      table_name);
+  if (q == NULL) {
+    sqlite3_result_error_nomem(ctx);
+    goto exit;
+  }
+  CHECK(
+      sqlite3_prepare_v2(db, q, sdslen(q) + 1, &stmt, NULL) == SQLITE_OK,
+      "Couldn't prepare statement: %s",
+      sqlite3_errmsg(db));
+  CHECK(
+      sqlite3_bind_int64(stmt, 1, id) == SQLITE_OK,
+      "Couldn't bind parameter to statement");
+  int err = sqlite3_step(stmt);
+  switch (err) {
+  case SQLITE_ROW:
+    res = sdscat(sdsempty(), sqlite3_column_text(stmt, 0));
+    CHECK(res != NULL, "Couldn't create string");
+    break;
+  case SQLITE_DONE:
+  default:
+    LOG_ERR("Couldn't get row from table: %s", sqlite3_errmsg(db));
+    goto error;
+  }
+
+  errflg = 0;
+exit:
+  if (q != NULL) {
+    sdsfree(q);
+  }
+  if (stmt != NULL) {
+    sqlite3_finalize(stmt);
+  }
+  if (!errflg) {
+    sqlite3_result_text(ctx, res, sdslen(res), (void (*)(void *))sdsfree);
+  }
+  return;
+error:
+  errflg = 1;
+  sqlite3_result_error(ctx, "db error", -1);
+  goto exit;
+}
+
+static void
 sqlite3_path_descend(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   if (argc != 5 || sqlite3_value_type(argv[0]) != SQLITE_TEXT ||
       sqlite3_value_type(argv[1]) != SQLITE_TEXT ||
@@ -47,6 +138,7 @@ sqlite3_path_descend(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   char **s_path = NULL;
   char *q = NULL;
   int ret = 1;
+  int errflg = 0;
   sqlite3 *db = sqlite3_context_db_handle(ctx);
   sqlite3_stmt *stmt = NULL;
 
@@ -143,10 +235,13 @@ exit:
   if (stmt != NULL) {
     sqlite3_finalize(stmt);
   }
-  sqlite3_result_int(ctx, ret);
+  if (!errflg) {
+    sqlite3_result_int(ctx, ret);
+  }
   return;
 error:
   sqlite3_result_error(ctx, "db error", -1);
+  errflg = 1;
   goto exit;
 }
 
@@ -260,6 +355,17 @@ int sqlite3_dbwextension_init(
       SQLITE_UTF8,
       NULL,
       sqlite3_path_descend,
+      NULL,
+      NULL,
+      NULL);
+
+  sqlite3_create_function_v2(
+      db,
+      "path_ascend",
+      3,
+      SQLITE_UTF8,
+      NULL,
+      sqlite3_path_ascend,
       NULL,
       NULL,
       NULL);
